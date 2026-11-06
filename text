@@ -1,0 +1,2350 @@
+angular:
+cnc .ts :
+import { Component, OnInit, inject, computed, signal, effect } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { BaseChartDirective } from 'ng2-charts';
+import { ChartConfiguration, ChartData, ChartType } from 'chart.js';
+import { CncService, MachineAnalytics } from '../services/cnc.service';
+import { RouterModule } from '@angular/router';
+
+export interface JournalRow {
+  timestamp: string | Date;
+  machine: string;
+  compteur: number;
+  delta: number | null;
+  intervalMin: number | null;
+  ppm: number | null;
+  /** Cible PPM de la machine concernée (pour la couleur dans le journal) */
+  targetPPM: number;
+}
+
+@Component({
+  selector: 'app-cnc-dashboard',
+  standalone: true,
+  imports: [CommonModule, FormsModule, BaseChartDirective, RouterModule],
+  templateUrl: './cnc-dashboard.component.html',
+  styleUrls: ['./cnc-dashboard.component.scss']
+})
+export class CncDashboardComponent implements OnInit {
+  cncSvc = inject(CncService);
+
+  /** Signal pour que journalRows / charts se mettent à jour au changement de filtre */
+  selectedMachine = signal<string>('ALL');
+
+  /** Cible globale (cible par défaut des machines sans cible propre) */
+  customTarget = 4;
+
+  /** Saisies de cible par machine (liées au HTML via ngModel). null/vide = cible par défaut */
+  machineTargetInputs: Record<string, number | null> = {};
+
+  private readonly palette = ['#3b82f6', '#f59e0b', '#ec4899', '#14b8a6', '#a855f7', '#ef4444'];
+
+  constructor() {
+    effect(() => {
+      this.customTarget = this.cncSvc.targetPPM();
+    });
+  }
+
+  ngOnInit(): void {
+    this.customTarget = this.cncSvc.targetPPM();
+    this.cncSvc.loadHistory(200).subscribe({
+      error: (err) => console.error('Erreur chargement CNC:', err)
+    });
+  }
+
+  onReset(): void {
+    this.cncSvc.resetData().subscribe({
+      next: () => this.onMachineSelect('ALL'),
+      error: (err) => console.error('Erreur reset CNC:', err)
+    });
+  }
+
+  // ---------- Analytics ----------
+
+  /** Liste des machines (une carte par machine, détectées automatiquement) */
+  analyticsList = computed(() => Array.from(this.cncSvc.analyticsMap().values()));
+
+  /** Libellé affiché au-dessus des KPI */
+  activeLabel = computed(() => {
+    const sel = this.selectedMachine();
+    const n = this.cncSvc.analyticsMap().size;
+    return sel === 'ALL' || !this.cncSvc.analyticsMap().has(sel)
+      ? `Toutes les machines (${n})`
+      : sel;
+  });
+
+  /**
+   * Analytics pour les KPI :
+   *  - machine sélectionnée → ses propres valeurs
+   *  - « Toutes les machines » → agrégat (somme des pièces et des cadences)
+   */
+  activeAnalytics = computed<MachineAnalytics>(() => {
+    const map = this.cncSvc.analyticsMap();
+    const sel = this.selectedMachine();
+
+    if (sel !== 'ALL' && map.has(sel)) {
+      return map.get(sel)!;
+    }
+
+    const values = Array.from(map.values());
+    if (values.length === 0) return this.emptyAnalytics();
+    if (values.length === 1) return values[0];
+    return this.aggregate(values);
+  });
+
+  private emptyAnalytics(): MachineAnalytics {
+    return {
+      machine: 'AUCUNE',
+      compteur: 0,
+      lastSeen: '-',
+      cadencePPM: 0,
+      instantPPM: 0,
+      avgPPM5: 0,
+      avgPPM60: 0,
+      targetPPM: this.cncSvc.targetPPM(),
+      rendementOEE: 0,
+      status: 'OFFLINE',
+      statusClass: 'status-offline',
+      statusLabel: 'AUCUNE DONNÉE',
+      producedLastHour: 0,
+      producedLastShift: 0,
+      dephasingAlert: 'OK',
+      dephasingMessage: 'Aucune machine connectée',
+      estimatedDowntimeMin: 0,
+      avgHistoricalPPM: 0,
+      bestHistoricalPPM: 0,
+      worstHistoricalPPM: 0
+    };
+  }
+
+  /** Agrégat de plusieurs machines (cadences et pièces cumulées) */
+  private aggregate(list: MachineAnalytics[]): MachineAnalytics {
+    const sum = (f: (m: MachineAnalytics) => number) => list.reduce((a, m) => a + f(m), 0);
+
+    const cadence = sum((m) => m.cadencePPM);
+    const target = sum((m) => m.targetPPM);
+    const running = list.filter((m) => m.status === 'RUNNING').length;
+    const slow = list.filter((m) => m.status === 'SLOW').length;
+    const n = list.length;
+
+    let status: MachineAnalytics['status'] = 'RUNNING';
+    let statusClass = 'status-running';
+    if (running === 0 && slow === 0) {
+      status = 'STOPPED';
+      statusClass = 'status-stopped';
+    } else if (running < n) {
+      status = 'SLOW';
+      statusClass = 'status-slow';
+    }
+
+    const crit = list.filter((m) => m.dephasingAlert === 'CRIT').length;
+    const warn = list.filter((m) => m.dephasingAlert === 'WARN').length;
+    const dephasingAlert: MachineAnalytics['dephasingAlert'] =
+      crit > 0 ? 'CRIT' : warn > 0 ? 'WARN' : 'OK';
+    const dephasingMessage =
+      crit + warn > 0
+        ? `${crit + warn} machine(s) en alerte sur ${n}`
+        : 'Toutes les machines sont conformes';
+
+    const lastSeen = list
+      .map((m) => m.lastSeen)
+      .filter((d) => d && d !== '-')
+      .sort()
+      .pop() ?? '-';
+
+    return {
+      machine: 'ALL',
+      compteur: sum((m) => m.compteur),
+      lastSeen,
+      cadencePPM: cadence,
+      instantPPM: cadence,
+      avgPPM5: sum((m) => m.avgPPM5),
+      avgPPM60: sum((m) => m.avgPPM60),
+      targetPPM: target,
+      rendementOEE: target > 0 ? Math.min(150, Math.round((cadence / target) * 100)) : 0,
+      status,
+      statusClass,
+      statusLabel: `${running}/${n} EN PRODUCTION`,
+      producedLastHour: sum((m) => m.producedLastHour),
+      producedLastShift: sum((m) => m.producedLastShift),
+      dephasingAlert,
+      dephasingMessage,
+      estimatedDowntimeMin: Math.max(...list.map((m) => m.estimatedDowntimeMin)),
+      avgHistoricalPPM: sum((m) => m.avgHistoricalPPM),
+      bestHistoricalPPM: sum((m) => m.bestHistoricalPPM),
+      worstHistoricalPPM: sum((m) => m.worstHistoricalPPM)
+    };
+  }
+
+  // ---------- Journal ----------
+
+  /**
+   * Lignes du journal pré-calculées côté TS
+   * (interdit d'utiliser new Date() dans le template HTML Angular).
+   * Le tick précédent est suivi PAR MACHINE : les ticks de machines différentes
+   * ne se mélangent plus.
+   */
+  journalRows = computed<JournalRow[]>(() => {
+    const recs = this.cncSvc.records();
+    const selMach = this.selectedMachine();
+    const analytics = this.cncSvc.analyticsMap();
+    const globalTarget = this.cncSvc.targetPPM();
+
+    const filtered = selMach === 'ALL' ? recs : recs.filter((r) => r.machine === selMach);
+
+    const sorted = [...filtered].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    const rows: JournalRow[] = [];
+    const lastByMachine = new Map<string, (typeof sorted)[number]>();
+
+    for (const curr of sorted) {
+      const prev = lastByMachine.get(curr.machine) ?? null;
+
+      let delta: number | null = null;
+      let intervalMin: number | null = null;
+      let ppm: number | null = null;
+
+      if (prev) {
+        delta = curr.compteur - prev.compteur;
+        const dtMs = new Date(curr.timestamp).getTime() - new Date(prev.timestamp).getTime();
+        if (dtMs > 0) {
+          intervalMin = dtMs / 60000;
+          if (delta >= 0) ppm = delta / intervalMin;
+        }
+      }
+
+      rows.push({
+        timestamp: curr.timestamp,
+        machine: curr.machine,
+        compteur: curr.compteur,
+        delta,
+        intervalMin,
+        ppm,
+        targetPPM: analytics.get(curr.machine)?.targetPPM ?? globalTarget
+      });
+      lastByMachine.set(curr.machine, curr);
+    }
+
+    // Plus récent en premier
+    return rows.reverse();
+  });
+
+  // ---------- Graphique cadence (ligne, une courbe par machine) ----------
+  cadenceChartType: ChartType = 'line';
+
+  cadenceChartData = computed<ChartData<'line'>>(() => {
+    const recs = this.cncSvc.records();
+    const sel = this.selectedMachine();
+    const filtered = sel === 'ALL' ? recs : recs.filter((r) => r.machine === sel);
+
+    const sorted = [...filtered].sort(
+      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+
+    // PPM calculé par machine
+    const series = new Map<string, { t: number; ppm: number }[]>();
+    const last = new Map<string, (typeof sorted)[number]>();
+
+    for (const curr of sorted) {
+      const prev = last.get(curr.machine);
+      last.set(curr.machine, curr);
+      if (!prev) continue;
+
+      const t = new Date(curr.timestamp).getTime();
+      const dtMin = (t - new Date(prev.timestamp).getTime()) / 60000;
+      const dCount = curr.compteur - prev.compteur;
+      if (dtMin > 0.05 && dCount >= 0) {
+        const arr = series.get(curr.machine) ?? [];
+        arr.push({ t, ppm: Number((dCount / dtMin).toFixed(2)) });
+        series.set(curr.machine, arr);
+      }
+    }
+
+    // 30 derniers points par machine, axe X commun
+    const trimmed = new Map<string, Map<number, number>>();
+    const allTimes = new Set<number>();
+    series.forEach((arr, m) => {
+      const pts = new Map<number, number>();
+      arr.slice(-30).forEach((p) => {
+        pts.set(p.t, p.ppm);
+        allTimes.add(p.t);
+      });
+      trimmed.set(m, pts);
+    });
+    const times = Array.from(allTimes).sort((a, b) => a - b);
+
+    const labels = times.map((t) =>
+      new Date(t).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      })
+    );
+
+    const datasets: ChartData<'line'>['datasets'] = [];
+    let i = 0;
+    trimmed.forEach((pts, m) => {
+      const color = this.palette[i++ % this.palette.length];
+      datasets.push({
+        data: times.map((t) => pts.get(t) ?? null),
+        label: `${m} (PPM)`,
+        borderColor: color,
+        backgroundColor: color + '26',
+        fill: sel !== 'ALL',
+        tension: 0.3,
+        pointRadius: 3,
+        spanGaps: true
+      });
+    });
+
+    // Ligne de cible : machine sélectionnée, ou machine unique en mode « Toutes »
+    const targetMachine: string | null =
+      sel !== 'ALL' ? sel : trimmed.size === 1 ? Array.from(trimmed.keys())[0] : null;
+
+    if (targetMachine) {
+      const target =
+        this.cncSvc.analyticsMap().get(targetMachine)?.targetPPM ?? this.cncSvc.targetPPM();
+      datasets.push({
+        data: times.map(() => target),
+        label: 'Cible Nominale (PPM)',
+        borderColor: '#10b981',
+        borderDash: [6, 4],
+        pointRadius: 0,
+        fill: false
+      });
+    }
+
+    return { labels, datasets };
+  });
+
+  cadenceChartOptions: ChartConfiguration['options'] = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        labels: { color: '#9ca3af', font: { size: 12 } }
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#9ca3af', font: { size: 10 } },
+        grid: { color: 'rgba(255,255,255,0.05)' }
+      },
+      y: {
+        ticks: { color: '#9ca3af' },
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        beginAtZero: true
+      }
+    }
+  };
+
+  // ---------- Graphique horaire (barres) ----------
+  hourlyChartType: ChartType = 'bar';
+
+  hourlyChartData = computed<ChartData<'bar'>>(() => {
+    const hourlyData = this.cncSvc.hourlyProduction();
+    return {
+      labels: hourlyData.map((h) => h.hourLabel),
+      datasets: [
+        {
+          data: hourlyData.map((h) => h.count),
+          label: 'Pièces / Heure',
+          backgroundColor: '#8b5cf6',
+          borderRadius: 4
+        }
+      ]
+    };
+  });
+
+  hourlyChartOptions: ChartConfiguration['options'] = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: {
+        labels: { color: '#9ca3af', font: { size: 12 } }
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#9ca3af', font: { size: 10 } },
+        grid: { color: 'rgba(255,255,255,0.05)' }
+      },
+      y: {
+        ticks: { color: '#9ca3af' },
+        grid: { color: 'rgba(255,255,255,0.05)' },
+        beginAtZero: true
+      }
+    }
+  };
+
+  // ---------- Actions UI ----------
+  onMachineSelect(machine: string): void {
+    this.selectedMachine.set(machine);
+    this.cncSvc.selectedMachine.set(machine);
+  }
+
+  /** Cible globale (par défaut) */
+  applyTarget(): void {
+    if (this.customTarget > 0) {
+      this.cncSvc.setTargetPPM(this.customTarget);
+    }
+  }
+
+  /** Cible propre à une machine (champ vide = retour à la cible par défaut) */
+  applyMachineTarget(machine: string): void {
+    const v = this.machineTargetInputs[machine];
+    const target = v != null && v > 0 ? v : null;
+    this.cncSvc.setMachineTarget(machine, target).subscribe({
+      next: () => (this.machineTargetInputs[machine] = null),
+      error: (err) => console.error('Erreur cible machine:', err)
+    });
+  }
+}
+
+cnc .html:
+<div class="cnc-container">
+    
+ <!-- Top Navigation & Controls -->
+<header class="top-bar">
+  <div class="title-section">
+    <a routerLink="/" class="back-home">← Accueil</a>
+    <h1><span class="pulse-icon">●</span> Moniteur Supérieur CNC & Analytics Production</h1>
+    <p class="subtitle">Analyse temps réel des cadences, déphasages et rendements machine</p>
+  </div>
+
+  <div class="controls-section">
+    <div class="title-section">
+    <a routerLink="/historique-production" class="back-home">historique</a></div>
+    
+    <!-- Target PPM Configurator -->
+    <div class="control-item">
+      <label for="targetInput">Cible Nominale (PPM):</label>
+      <div class="input-group">
+        <input
+          id="targetInput"
+          type="number"
+          [(ngModel)]="customTarget"
+          min="0.1"
+          step="0.5"
+          (change)="applyTarget()"
+        />
+        <button class="btn-apply" type="button" (click)="applyTarget()">Valider</button>
+      </div>
+    </div>
+
+    <!-- Machine Filter -->
+    <div class="control-item">
+      <label for="machineSelect">Filtre Machine:</label>
+      <select
+        id="machineSelect"
+        [ngModel]="selectedMachine()"
+        (ngModelChange)="onMachineSelect($event)"
+      >
+        <option value="ALL">Toutes les Machines</option>
+        <option *ngFor="let m of cncSvc.machineNames()" [value]="m">{{ m }}</option>
+      </select>
+    </div>
+
+    <button class="btn-danger" type="button" (click)="onReset()">Réinitialiser CNC</button>
+  </div>
+</header>
+  <!-- Machine Cards Overview Grid -->
+  <section class="cards-grid">
+    <div
+      *ngFor="let item of analyticsList()"
+      class="machine-card"
+      [class.active-card]="selectedMachine() === item.machine"
+      (click)="onMachineSelect(item.machine)"
+    >
+      <div class="card-header">
+        <div class="machine-id">
+          <span class="icon">🤖</span>
+          <h3>{{ item.machine }}</h3>
+        </div>
+        <span class="status-badge" [ngClass]="item.statusClass">{{ item.statusLabel }}</span>
+      </div>
+
+      <!-- Alert Banner inside Card if active -->
+      <div
+        *ngIf="item.dephasingAlert !== 'OK'"
+        class="alert-banner"
+        [class.alert-crit]="item.dephasingAlert === 'CRIT'"
+        [class.alert-warn]="item.dephasingAlert === 'WARN'"
+      >
+        <span class="alert-icon">⚠️</span>
+        <span class="alert-text">{{ item.dephasingMessage }}</span>
+      </div>
+
+      <div class="card-metrics">
+        <div class="metric-main">
+          <span class="label">Rendement Cadence</span>
+          <div
+            class="val-oee"
+            [class.oee-ok]="item.rendementOEE >= 80"
+            [class.oee-warn]="item.rendementOEE < 80 && item.rendementOEE >= 50"
+            [class.oee-bad]="item.rendementOEE < 50"
+          >
+            {{ item.rendementOEE }}%
+          </div>
+        </div>
+
+        <div class="metric-sub">
+          <div class="sub-item">
+            <span class="sub-label">Instant (PPM)</span>
+            <span class="sub-val">{{ item.cadencePPM | number:'1.1-1' }}</span>
+          </div>
+          <div class="sub-item">
+            <span class="sub-label">Moy. 5m (PPM)</span>
+            <span class="sub-val">{{ item.avgPPM5 | number:'1.1-1' }}</span>
+          </div>
+          <div class="sub-item">
+            <span class="sub-label">Compteur Total</span>
+            <span class="sub-val highlight">{{ item.compteur | number }}</span>
+          </div>
+        </div>
+      </div>
+<div class="machine-target" (click)="$event.stopPropagation()">
+  <span class="sub-label">Cible : {{ item.targetPPM }} PPM</span>
+  <input type="number" min="0.1" step="0.05" placeholder="Cible par défaut"
+         [(ngModel)]="machineTargetInputs[item.machine]"
+         (keyup.enter)="applyMachineTarget(item.machine)" />
+  <button type="button" class="btn-apply" (click)="applyMachineTarget(item.machine)">OK</button>
+</div>
+      <div class="card-footer">
+        <span>Dernier signal: {{ item.lastSeen | date:'HH:mm:ss' }}</span>
+        <span *ngIf="item.estimatedDowntimeMin > 0" class="downtime-text">
+          Arrêt: {{ item.estimatedDowntimeMin }} min
+        </span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Detailed Analytics Section -->
+   
+  <section class="details-section" *ngIf="activeAnalytics() as data">
+    <!-- Summary KPIs Bar -->
+    <div class="kpi-row">
+      
+      <div class="kpi-card">
+        <span class="kpi-title">Cadence Instantanée</span>
+        <div class="kpi-value blue">
+          {{ data.cadencePPM | number:'1.1-2' }} <small>PPM</small>
+        </div>
+        <span class="kpi-sub">Cible: {{ data.targetPPM }} PPM</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Moyenne 60 Min</span>
+        <div class="kpi-value purple">
+          {{ data.avgPPM60 | number:'1.1-2' }} <small>PPM</small>
+        </div>
+        <span class="kpi-sub">{{ data.producedLastHour }} pièces cette heure</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Production du Poste (00h+)</span>
+        <div class="kpi-value green">
+          {{ data.producedLastShift | number }} <small>pcs</small>
+        </div>
+        <span class="kpi-sub">Total compteur: {{ data.compteur }}</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Statistiques Historiques</span>
+        <div class="kpi-stats">
+          <div>
+            <small>Max:</small>
+            <strong>{{ data.bestHistoricalPPM | number:'1.1-1' }}</strong>
+          </div>
+          <div>
+            <small>Moy:</small>
+            <strong>{{ data.avgHistoricalPPM | number:'1.1-1' }}</strong>
+          </div>
+          <div>
+            <small>Min:</small>
+            <strong>{{ data.worstHistoricalPPM | number:'1.1-1' }}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Row -->
+    <div class="charts-row">
+      <div class="chart-box">
+        <h3>📈 Graphique de Cadence en Temps Réel vs Cible (PPM)</h3>
+        <div class="chart-wrapper">
+          <canvas
+            baseChart
+            [data]="cadenceChartData()"
+            [options]="cadenceChartOptions"
+            [type]="cadenceChartType"
+          >
+          </canvas>
+        </div>
+      </div>
+
+      <div class="chart-box">
+        <h3>📊 Production Horaire (Pièces / Heure)</h3>
+        <div class="chart-wrapper">
+          <canvas
+            baseChart
+            [data]="hourlyChartData()"
+            [options]="hourlyChartOptions"
+            [type]="hourlyChartType"
+          >
+          </canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Journal Table of Recent Events -->
+    <div class="journal-box">
+      <div class="journal-header">
+        <h3>📋 Journal des Ticks CNC & Calcul d'Intervalle</h3>
+        <span class="journal-count">{{ journalRows().length }} enregistrements</span>
+      </div>
+
+      <div class="table-wrapper">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Horodatage</th>
+              <th>Machine</th>
+              <th>Compteur Total</th>
+              <th>Δ Pièces</th>
+              <th>Intervalle (min)</th>
+              <th>Cadence Calculée (PPM)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let row of journalRows()">
+              <td>{{ row.timestamp | date:'dd/MM/yyyy HH:mm:ss' }}</td>
+              <td><span class="machine-tag">{{ row.machine }}</span></td>
+              <td class="num highlight">{{ row.compteur | number }}</td>
+
+              <td class="num">
+                <span *ngIf="row.delta !== null" class="delta-plus">+{{ row.delta }}</span>
+                <span *ngIf="row.delta === null" class="muted">-</span>
+              </td>
+
+              <td class="num">
+                <span *ngIf="row.intervalMin !== null">
+                  {{ row.intervalMin | number:'1.1-1' }} min
+                </span>
+                <span *ngIf="row.intervalMin === null" class="muted">-</span>
+              </td>
+
+              <td class="num font-bold">
+                <span
+                  *ngIf="row.ppm !== null"
+                    [class.text-green]="row.ppm >= row.targetPPM"
+                    [class.text-warn]="row.ppm < row.targetPPM"
+                >
+                  {{ row.ppm | number:'1.2-2' }} PPM
+                </span>
+                <span *ngIf="row.ppm === null" class="muted">-</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+
+cnc .scss
+.cnc-container {
+  padding: 1.5rem;
+  background-color: #0b1220;
+  color: #f3f4f6;
+  min-height: 100vh;
+  font-family: system-ui, -apple-system, sans-serif;
+
+  .top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #111827;
+    padding: 1rem 1.5rem;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 1.5rem;
+
+    .title-section {
+      h1 {
+        font-size: 1.4rem;
+        font-weight: 700;
+        margin: 0;
+        color: #f9fafb;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+
+        .pulse-icon {
+          color: #10b981;
+          font-size: 0.9rem;
+          animation: pulse 2s infinite;
+        }
+      }
+
+      .subtitle {
+        font-size: 0.85rem;
+        color: #9ca3af;
+        margin: 0.25rem 0 0 0;
+      }
+    }
+
+    .controls-section {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+
+      .control-item {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+
+        label {
+          font-size: 0.75rem;
+          color: #9ca3af;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+
+        select, input {
+          background: #1f2937;
+          border: 1px solid #374151;
+          color: #fff;
+          padding: 0.4rem 0.75rem;
+          border-radius: 6px;
+          font-size: 0.875rem;
+          outline: none;
+
+          &:focus {
+            border-color: #3b82f6;
+          }
+        }
+
+        .input-group {
+          display: flex;
+          gap: 0.5rem;
+
+          input {
+            width: 70px;
+          }
+
+          .btn-apply {
+            background: #3b82f6;
+            color: #fff;
+            border: none;
+            padding: 0.4rem 0.75rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 600;
+
+            &:hover {
+              background: #2563eb;
+            }
+          }
+        }
+      }
+
+      .btn-danger {
+        background: rgba(239, 68, 68, 0.15);
+        color: #ef4444;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 0.85rem;
+        margin-top: 1rem;
+
+        &:hover {
+          background: rgba(239, 68, 68, 0.25);
+        }
+      }
+    }
+  }
+
+  .cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+
+    .machine-card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 10px;
+      padding: 1rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+
+      &:hover {
+        border-color: #3b82f6;
+        transform: translateY(-2px);
+      }
+
+      &.active-card {
+        border-color: #3b82f6;
+        box-shadow: 0 0 12px rgba(59, 130, 246, 0.25);
+      }
+
+      .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.75rem;
+
+        .machine-id {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+
+          h3 {
+            margin: 0;
+            font-size: 1.1rem;
+            color: #f3f4f6;
+          }
+        }
+
+        .status-badge {
+          font-size: 0.7rem;
+          font-weight: 700;
+          padding: 0.25rem 0.6rem;
+          border-radius: 20px;
+          text-transform: uppercase;
+
+          &.status-running { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+          &.status-slow { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+          &.status-stopped { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+          &.status-offline { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+        }
+      }
+
+      .alert-banner {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        margin-bottom: 0.75rem;
+
+        &.alert-crit { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+        &.alert-warn { background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid rgba(245, 158, 11, 0.3); }
+      }
+
+      .card-metrics {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: #1f2937;
+        padding: 0.75rem;
+        border-radius: 8px;
+
+        .metric-main {
+          display: flex;
+          flex-direction: column;
+
+          .label { font-size: 0.7rem; color: #9ca3af; }
+          .val-oee {
+            font-size: 1.6rem;
+            font-weight: 800;
+            margin-top: 0.2rem;
+            &.oee-ok { color: #10b981; }
+            &.oee-warn { color: #f59e0b; }
+            &.oee-bad { color: #ef4444; }
+          }
+        }
+
+        .metric-sub {
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+          text-align: right;
+
+          .sub-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.75rem;
+            font-size: 0.75rem;
+
+            .sub-label { color: #9ca3af; }
+            .sub-val { font-weight: 600; color: #e5e7eb; }
+            .highlight { color: #60a5fa; }
+          }
+        }
+      }
+
+      .card-footer {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.7rem;
+        color: #6b7280;
+        margin-top: 0.5rem;
+
+        .downtime-text { color: #ef4444; font-weight: 600; }
+      }
+    }
+  }
+
+  .details-section {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+
+      .kpi-card {
+        background: #111827;
+        border: 1px solid #1f2937;
+        padding: 1rem;
+        border-radius: 10px;
+
+        .kpi-title { font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; }
+        .kpi-value {
+          font-size: 1.8rem;
+          font-weight: 800;
+          margin: 0.4rem 0;
+
+          &.blue { color: #3b82f6; }
+          &.purple { color: #8b5cf6; }
+          &.green { color: #10b981; }
+
+          small { font-size: 0.9rem; font-weight: 400; color: #9ca3af; }
+        }
+        .kpi-sub { font-size: 0.75rem; color: #6b7280; }
+
+        .kpi-stats {
+          display: flex;
+          justify-content: space-between;
+          margin-top: 0.5rem;
+          font-size: 0.8rem;
+          color: #d1d5db;
+        }
+      }
+    }
+
+    .charts-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+
+      @media (max-width: 1024px) {
+        grid-template-columns: 1fr;
+      }
+
+      .chart-box {
+        background: #111827;
+        border: 1px solid #1f2937;
+        padding: 1rem;
+        border-radius: 10px;
+
+        h3 { font-size: 0.95rem; margin-top: 0; margin-bottom: 1rem; color: #e5e7eb; }
+        .chart-wrapper { position: relative; height: 260px; }
+      }
+    }
+
+    .journal-box {
+      background: #111827;
+      border: 1px solid #1f2937;
+      padding: 1rem;
+      border-radius: 10px;
+
+      .journal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1rem;
+
+        h3 { font-size: 1rem; margin: 0; color: #e5e7eb; }
+        .journal-count { font-size: 0.75rem; color: #9ca3af; }
+      }
+
+      .table-wrapper {
+        overflow-x: auto;
+
+        .data-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.85rem;
+
+          th {
+            background: #1f2937;
+            color: #9ca3af;
+            text-align: left;
+            padding: 0.6rem 0.8rem;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+          }
+
+          td {
+            padding: 0.6rem 0.8rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+
+            &.num { text-align: right; }
+            &.highlight { color: #60a5fa; font-weight: 600; }
+            &.font-bold { font-weight: 700; }
+          }
+
+          .machine-tag {
+            background: rgba(59, 130, 246, 0.15);
+            color: #60a5fa;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+          }
+
+          .delta-plus { color: #10b981; font-weight: 600; }
+          .muted { color: #4b5563; }
+          .text-green { color: #10b981; }
+          .text-warn { color: #f59e0b; }
+        }
+      }
+    }
+  }
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+.title-section {
+  .back-home {
+    display: inline-block;
+    margin-bottom: 0.4rem;
+    color: #60a5fa;
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: color 0.15s ease;
+
+    &:hover {
+      color: #93c5fd;
+      text-decoration: underline;
+    }
+  }
+
+  // ... h1, subtitle déjà présents
+}
+.kpi-stats {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: #d1d5db;
+  gap: 0.5rem; /* Ajout d'un espacement */
+} 
+      .machine-target {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+
+        .sub-label {
+          font-size: 0.75rem;
+          color: #9ca3af;
+          white-space: nowrap;
+        }
+
+        input {
+          flex: 1;
+          min-width: 0;
+          background: #1f2937;
+          border: 1px solid #374151;
+          color: #fff;
+          padding: 0.3rem 0.5rem;
+          border-radius: 6px;
+          font-size: 0.75rem;
+          outline: none;
+
+          &:focus { border-color: #3b82f6; }
+          &::placeholder { color: #6b7280; }
+        }
+
+        .btn-apply {
+          background: #3b82f6;
+          color: #fff;
+          border: none;
+          padding: 0.3rem 0.65rem;
+          border-radius: 6px;
+          cursor: pointer;
+          font-size: 0.75rem;
+          font-weight: 600;
+
+          &:hover { background: #2563eb; }
+        }
+      }
+          .kpi-scope {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+historique .ts
+import { Component, OnDestroy, OnInit, computed, inject, signal } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { RouterModule } from '@angular/router';
+import { BaseChartDirective } from 'ng2-charts';
+import { ChartConfiguration, ChartData, ChartType } from 'chart.js';
+import { forkJoin } from 'rxjs';
+import {
+  Analysis,
+  AnalysisEvent,
+  AnalysisWindow,
+  ProductionService,
+  ShiftSettings
+} from '../services/production.service';
+
+interface Segment {
+  left: number;
+  width: number;
+  type: 'late' | 'run' | 'minor' | 'major' | 'end';
+  title: string;
+}
+
+function toDateStr(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+const CATEGORIES = [
+  'Changement de barre (fer)',
+  'Changement d’outil',
+  'Réglage / mise au point',
+  'Panne mécanique',
+  'Panne électrique',
+  'Manque matière',
+  'Maintenance',
+  'Pause / repos',
+  'Contrôle qualité',
+  'Attente opérateur',
+  'Autre'
+];
+
+@Component({
+  selector: 'app-historique-production',
+  standalone: true,
+  imports: [CommonModule, FormsModule, RouterModule, BaseChartDirective],
+  templateUrl: './historique-production.component.html',
+  styleUrls: ['./historique-production.component.scss']
+})
+export class HistoriqueProductionComponent implements OnInit, OnDestroy {
+  prodSvc = inject(ProductionService);
+
+  readonly categories = CATEGORIES;
+
+  // ---------- État ----------
+  selectedMachine = signal<string>('');
+  selectedDate = signal<string>(toDateStr(new Date()));
+  analysis = signal<Analysis | null>(null);
+  loading = signal(false);
+  error = signal('');
+  showSettings = signal(false);
+  /** Événements déjà justifiés que l'utilisateur veut modifier */
+  reopened = signal<Set<string>>(new Set());
+
+  shiftForm: ShiftSettings = { shiftStart: '05:00', shiftEnd: '21:00', minorStopSec: 90, majorStopSec: 300 };
+  settingsMsg = '';
+  reasonMsg: Record<string, string> = {};
+  private drafts: Record<string, { category: string; comment: string }> = {};
+
+  private timer?: ReturnType<typeof setInterval>;
+  private pending?: ReturnType<typeof setTimeout>;
+
+  // ---------- Machine ----------
+  effectiveMachine = computed(() => this.selectedMachine() || this.prodSvc.machineInfo()[0]?.ip || '');
+
+  currentInfo = computed(
+    () => this.prodSvc.machineInfo().find((m) => m.ip === this.effectiveMachine()) ?? null
+  );
+
+  isToday = computed(() => this.selectedDate() === toDateStr(new Date()));
+
+  // ---------- Cycle de vie ----------
+  ngOnInit(): void {
+    forkJoin([this.prodSvc.loadMachineInfo(), this.prodSvc.loadShift()]).subscribe({
+      next: () => this.load(false),
+      error: () => this.error.set('Impossible de joindre le serveur (backend démarré ?)')
+    });
+
+    // Rafraîchissement régulier : indispensable pour détecter un arrêt (aucun signal n'arrive !)
+    this.timer = setInterval(() => this.load(), 10000);
+
+    this.prodSvc.socket.on('cncUpdate', this.onLive);
+    this.prodSvc.socket.on('stopReasonUpdate', this.onLive);
+    this.prodSvc.socket.on('shiftSettingsUpdate', this.onLive);
+  }
+
+  ngOnDestroy(): void {
+    clearInterval(this.timer);
+    clearTimeout(this.pending);
+    this.prodSvc.socket.off('cncUpdate', this.onLive);
+    this.prodSvc.socket.off('stopReasonUpdate', this.onLive);
+    this.prodSvc.socket.off('shiftSettingsUpdate', this.onLive);
+  }
+
+  private onLive = (p?: { machine?: string }): void => {
+    if (p && p.machine && p.machine !== this.effectiveMachine()) return;
+    clearTimeout(this.pending);
+    this.pending = setTimeout(() => this.load(), 1200);
+  };
+
+  // ---------- Chargement ----------
+  private windowFor(date: string, s: ShiftSettings): AnalysisWindow {
+    const [y, m, d] = date.split('-').map(Number);
+    const at = (hhmm: string) => {
+      const [h, mi] = hhmm.split(':').map(Number);
+      return new Date(y, m - 1, d, h, mi, 0, 0).toISOString();
+    };
+    return {
+      from: new Date(y, m - 1, d, 0, 0, 0, 0).toISOString(),
+      to: new Date(y, m - 1, d + 1, 0, 0, 0, 0).toISOString(),
+      idealStart: at(s.shiftStart),
+      idealEnd: at(s.shiftEnd)
+    };
+  }
+
+  load(silent = true): void {
+    const machine = this.effectiveMachine();
+    if (!machine) return;
+    const date = this.selectedDate();
+    if (!silent) this.loading.set(true);
+
+    this.prodSvc.getAnalysis(machine, date, this.windowFor(date, this.prodSvc.shift())).subscribe({
+      next: (a) => {
+        if (a.machine !== this.effectiveMachine() || a.date !== this.selectedDate()) return; // réponse périmée
+        this.analysis.set(a);
+        this.loading.set(false);
+        this.error.set('');
+      },
+      error: (err) => {
+        this.loading.set(false);
+        this.error.set(err?.error?.error || 'Erreur de chargement de l’analyse');
+      }
+    });
+  }
+
+  onMachineChange(ip: string): void {
+    this.selectedMachine.set(ip);
+    this.analysis.set(null);
+    this.reopened.set(new Set());
+    this.load(false);
+  }
+
+  onDateChange(date: string): void {
+    if (!date) return;
+    this.selectedDate.set(date);
+    this.analysis.set(null);
+    this.reopened.set(new Set());
+    this.load(false);
+  }
+
+  shiftDay(delta: number): void {
+    const [y, m, d] = this.selectedDate().split('-').map(Number);
+    this.onDateChange(toDateStr(new Date(y, m - 1, d + delta)));
+  }
+
+  goToday(): void {
+    this.onDateChange(toDateStr(new Date()));
+  }
+
+  // ---------- Réglages de poste ----------
+  toggleSettings(): void {
+    if (!this.showSettings()) this.shiftForm = { ...this.prodSvc.shift() };
+    this.settingsMsg = '';
+    this.showSettings.update((v) => !v);
+  }
+
+  saveSettings(): void {
+    this.prodSvc.saveShift(this.shiftForm).subscribe({
+      next: () => {
+        this.settingsMsg = 'Enregistré ✓';
+        this.load();
+        setTimeout(() => (this.settingsMsg = ''), 3000);
+      },
+      error: (err) => (this.settingsMsg = err?.error?.error || 'Erreur d’enregistrement')
+    });
+  }
+
+  // ---------- Alertes & justifications ----------
+  /** À traiter : arrêt en cours, ou événement non justifié, ou justification rouverte */
+  alerts = computed<AnalysisEvent[]>(() => {
+    const a = this.analysis();
+    if (!a) return [];
+    const re = this.reopened();
+    return a.events
+      .filter((e) => e.ongoing || !e.justified || re.has(e.ref))
+      .sort(
+        (x, y) =>
+          Number(y.ongoing) - Number(x.ongoing) ||
+          Number(y.severity === 'MAJOR') - Number(x.severity === 'MAJOR') ||
+          Date.parse(y.startTs) - Date.parse(x.startTs)
+      );
+  });
+
+  banner = computed(() => {
+    const urgent = this.alerts().filter((e) => e.ongoing || !e.justified);
+    if (urgent.length === 0) return null;
+    return {
+      count: urgent.length,
+      major: urgent.some((e) => e.severity === 'MAJOR'),
+      ongoing: urgent.some((e) => e.ongoing)
+    };
+  });
+
+  trackRef = (_: number, e: AnalysisEvent) => e.ref;
+
+  draft(e: AnalysisEvent): { category: string; comment: string } {
+    return (this.drafts[e.ref] ??= { category: e.category ?? '', comment: e.comment ?? '' });
+  }
+  setCategory(e: AnalysisEvent, v: string): void { this.draft(e).category = v; }
+  setComment(e: AnalysisEvent, v: string): void { this.draft(e).comment = v; }
+
+  saveReason(e: AnalysisEvent): void {
+    const d = this.draft(e);
+    this.prodSvc.saveReason(this.effectiveMachine(), e.ref, d.category, d.comment).subscribe({
+      next: () => {
+        this.reopened.update((s) => { const n = new Set(s); n.delete(e.ref); return n; });
+        this.reasonMsg[e.ref] = 'Justification enregistrée ✓';
+        this.load();
+        setTimeout(() => delete this.reasonMsg[e.ref], 3000);
+      },
+      error: (err) => (this.reasonMsg[e.ref] = err?.error?.error || 'Erreur d’enregistrement')
+    });
+  }
+
+  reopen(e: AnalysisEvent): void {
+    this.reopened.update((s) => new Set(s).add(e.ref));
+  }
+
+  blinks(e: AnalysisEvent): boolean {
+    return e.ongoing || !e.justified;
+  }
+
+  eventTitle(e: AnalysisEvent): string {
+    if (e.type === 'START') return e.ongoing ? 'Machine non démarrée' : 'Retard de démarrage';
+    if (e.type === 'END') return 'Fin de production anticipée';
+    if (e.severity === 'MAJOR') return e.ongoing ? 'ARRÊT GRAVE EN COURS' : 'Arrêt grave';
+    return e.ongoing ? 'Arrêt en cours' : 'Arrêt';
+  }
+
+  // ---------- Statut ----------
+  statusInfo = computed(() => {
+    const s = this.analysis()?.real.status;
+    switch (s) {
+      case 'RUNNING': return { label: 'EN PRODUCTION', cls: 'st-run' };
+      case 'STOP_MINOR': return { label: 'ARRÊT', cls: 'st-minor' };
+      case 'STOP_MAJOR': return { label: 'ARRÊT GRAVE', cls: 'st-major' };
+      case 'FINISHED': return { label: 'JOURNÉE TERMINÉE', cls: 'st-done' };
+      default: return { label: 'EN ATTENTE', cls: 'st-wait' };
+    }
+  });
+
+  // ---------- Formats ----------
+  dur(min: number): string {
+    if (min < 10) return `${(Math.round(min * 10) / 10).toString().replace('.', ',')} min`;
+    const m = Math.round(min);
+    if (m < 60) return `${m} min`;
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return r ? `${h} h ${String(r).padStart(2, '0')}` : `${h} h`;
+  }
+
+  secLabel(sec: number): string {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return m ? (s ? `${m} min ${s} s` : `${m} min`) : `${s} s`;
+  }
+
+  private hhmm(ms: number): string {
+    return new Date(ms).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  totalLostPieces(a: Analysis): number {
+    return a.causes.reduce((s, c) => s + c.pieces, 0);
+  }
+
+  causeWidth(a: Analysis, pieces: number): number {
+    const max = a.causes[0]?.pieces || 1;
+    return Math.max(3, (pieces / max) * 100);
+  }
+
+  progressPct(a: Analysis): number {
+    return a.ideal.pieces > 0 ? Math.min(100, (a.real.pieces / a.ideal.pieces) * 100) : 0;
+  }
+
+  markerPct(a: Analysis): number {
+    return a.ideal.pieces > 0 ? Math.min(100, (a.ideal.piecesToDate / a.ideal.pieces) * 100) : 0;
+  }
+
+  // ---------- Chronologie (barre de temps) ----------
+  timelineBar = computed(() => {
+    const a = this.analysis();
+    if (!a) return null;
+
+    const ms = (s: string) => Date.parse(s);
+    const S = ms(a.ideal.start);
+    const E = ms(a.ideal.end);
+    const now = ms(a.now);
+    const rs = a.real.start ? ms(a.real.start) : null;
+    const re = a.real.end ? ms(a.real.end) : null;
+    const live = a.real.status !== 'FINISHED' && now < E;
+
+    const axisStart = Math.min(S, rs ?? S);
+    const axisEnd = Math.max(E, re ?? E);
+    const span = axisEnd - axisStart || 1;
+    const pos = (t: number) => ((t - axisStart) / span) * 100;
+    const seg = (from: number, to: number, type: Segment['type'], title: string): Segment => ({
+      left: pos(from),
+      width: Math.max(0.4, pos(to) - pos(from)),
+      type,
+      title
+    });
+
+    const segs: Segment[] = [];
+    if (a.start.lateMin > 0) {
+      segs.push(seg(S, rs ?? Math.min(now, E), 'late', `Retard de démarrage : ${this.dur(a.start.lateMin)}`));
+    }
+    if (rs !== null) {
+      segs.push(seg(rs, live ? now : re ?? rs, 'run', 'Production'));
+    }
+    for (const e of a.events) {
+      if (e.type !== 'STOP') continue;
+      const from = ms(e.startTs);
+      const to = e.endTs ? ms(e.endTs) : now;
+      segs.push(
+        seg(from, to, e.severity === 'MAJOR' ? 'major' : 'minor',
+          `${this.eventTitle(e)} : ${this.hhmm(from)} → ${e.endTs ? this.hhmm(to) : 'en cours'} (${this.dur(e.durationMin)})`)
+      );
+    }
+    if (a.end.earlyMin > 0 && re !== null) {
+      segs.push(seg(re, E, 'end', `Fin anticipée : ${this.dur(a.end.earlyMin)}`));
+    }
+
+    const step = span > 12 * 3600000 ? 2 : 1;
+    const ticks: { left: number; label: string }[] = [];
+    for (let t = Math.ceil(axisStart / 3600000) * 3600000; t <= axisEnd; t += 3600000) {
+      if (new Date(t).getHours() % step === 0) ticks.push({ left: pos(t), label: this.hhmm(t) });
+    }
+
+    return {
+      segs,
+      ticks,
+      idealLeft: pos(S),
+      idealRight: pos(E),
+      nowLeft: live && now >= axisStart ? pos(now) : null
+    };
+  });
+
+  // ---------- Graphiques ----------
+  lineType: ChartType = 'line';
+  barType: ChartType = 'bar';
+
+  cumulativeChart = computed<ChartData<'line'>>(() => {
+    const a = this.analysis();
+    if (!a) return { labels: [], datasets: [] };
+    const now = Date.parse(a.now);
+    const BUCKET = 15 * 60000;
+
+    let cr = 0;
+    let ci = 0;
+    const labels: string[] = [];
+    const real: (number | null)[] = [];
+    const ideal: number[] = [];
+    for (const b of a.timeline) {
+      cr += b.pieces;
+      ci += b.idealFull;
+      labels.push(this.hhmm(b.t + BUCKET));
+      real.push(b.t <= now ? cr : null);
+      ideal.push(Math.round(ci));
+    }
+
+    return {
+      labels,
+      datasets: [
+        {
+          data: real,
+          label: 'Production réelle (cumul)',
+          borderColor: '#10b981',
+          backgroundColor: 'rgba(16, 185, 129, 0.15)',
+          fill: true,
+          tension: 0.25,
+          pointRadius: 0,
+          borderWidth: 2
+        },
+        {
+          data: ideal,
+          label: 'Production idéale (cumul)',
+          borderColor: '#f59e0b',
+          borderDash: [6, 4],
+          pointRadius: 0,
+          fill: false,
+          borderWidth: 2
+        }
+      ]
+    };
+  });
+
+  slotChart = computed<ChartData<'bar'>>(() => {
+    const a = this.analysis();
+    if (!a) return { labels: [], datasets: [] };
+    const now = Date.parse(a.now);
+
+    const labels = a.timeline.map((b) => this.hhmm(b.t));
+    const real = a.timeline.map((b) => (b.t <= now ? b.pieces : null));
+    const colors = a.timeline.map((b) => {
+      if (b.idealFull <= 0) return '#3b82f6';                 // hors poste : gain
+      const r = b.pieces / b.idealFull;
+      return r >= 0.9 ? '#10b981' : r >= 0.5 ? '#f59e0b' : '#ef4444';
+    });
+
+    return {
+      labels,
+      datasets: [
+        { data: real, label: 'Réel / 15 min', backgroundColor: colors, borderRadius: 3 },
+        { data: a.timeline.map((b) => b.idealFull), label: 'Idéal / 15 min', backgroundColor: 'rgba(148,163,184,0.35)', borderRadius: 3 }
+      ]
+    };
+  });
+
+  private baseOptions(): NonNullable<ChartConfiguration['options']> {
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { labels: { color: '#9ca3af', font: { size: 12 } } } },
+      scales: {
+        x: {
+          ticks: { color: '#9ca3af', font: { size: 10 }, autoSkip: true, maxTicksLimit: 14 },
+          grid: { color: 'rgba(255,255,255,0.05)' }
+        },
+        y: {
+          ticks: { color: '#9ca3af' },
+          grid: { color: 'rgba(255,255,255,0.05)' },
+          beginAtZero: true
+        }
+      }
+    };
+  }
+
+  cumulativeOptions: ChartConfiguration['options'] = this.baseOptions();
+  slotOptions: ChartConfiguration['options'] = this.baseOptions();
+}
+
+
+historique .html:
+<div class="prod-container">
+
+  <!-- ============ En-tête & contrôles ============ -->
+  <header class="top-bar">
+    <div class="title-section">
+      <a routerLink="/cnc" class="back-home">← Accueil</a>
+      <h1><span class="pulse-icon">●</span> Historique & Bilan de Production</h1>
+      <p class="subtitle">Démarrage réel, arrêts, production réelle vs idéale et causes des pertes de temps</p>
+    </div>
+
+    <div class="controls-section">
+      <div class="control-item">
+        <label for="machineSel">Machine :</label>
+        <select id="machineSel" [ngModel]="effectiveMachine()" (ngModelChange)="onMachineChange($event)">
+          <option *ngFor="let m of prodSvc.machineInfo()" [value]="m.ip">
+            {{ m.machineName || m.ip }}{{ m.machineName ? ' (' + m.ip + ')' : '' }}{{ m.article ? ' — ' + m.article : '' }}
+          </option>
+        </select>
+      </div>
+
+      <div class="control-item">
+        <label for="dateSel">Journée :</label>
+        <div class="date-nav">
+          <button type="button" class="btn-ghost" (click)="shiftDay(-1)" title="Jour précédent">‹</button>
+          <input id="dateSel" type="date" [ngModel]="selectedDate()" (ngModelChange)="onDateChange($event)" />
+          <button type="button" class="btn-ghost" (click)="shiftDay(1)" title="Jour suivant">›</button>
+          <button type="button" class="btn-ghost" (click)="goToday()" [disabled]="isToday()">Aujourd’hui</button>
+        </div>
+      </div>
+
+      <button type="button" class="btn-settings" (click)="toggleSettings()">
+        ⚙ Réglages du poste
+      </button>
+    </div>
+  </header>
+
+  <!-- ============ Réglages du poste ============ -->
+  <section class="settings-panel" *ngIf="showSettings()">
+    <h3>⚙ Réglages du poste idéal</h3>
+    <div class="settings-grid">
+      <div class="field">
+        <label for="shStart">Début idéal</label>
+        <input id="shStart" type="time" [(ngModel)]="shiftForm.shiftStart" />
+      </div>
+      <div class="field">
+        <label for="shEnd">Fin idéale</label>
+        <input id="shEnd" type="time" [(ngModel)]="shiftForm.shiftEnd" />
+      </div>
+      <div class="field">
+        <label for="shMinor">Arrêt : silence ≥ (secondes)</label>
+        <input id="shMinor" type="number" min="10" step="10" [(ngModel)]="shiftForm.minorStopSec" />
+      </div>
+      <div class="field">
+        <label for="shMajor">Arrêt grave : silence ≥ (secondes)</label>
+        <input id="shMajor" type="number" min="30" step="30" [(ngModel)]="shiftForm.majorStopSec" />
+      </div>
+      <div class="field field-btn">
+        <button type="button" class="btn-primary" (click)="saveSettings()">Enregistrer</button>
+        <span class="msg" *ngIf="settingsMsg">{{ settingsMsg }}</span>
+      </div>
+    </div>
+    <p class="hint">
+      Les seuils sont automatiquement relevés pour les machines lentes (jamais moins de 2 × l’intervalle
+      normal entre deux pièces). Ces réglages s’appliquent à toutes les machines.
+    </p>
+  </section>
+
+  <div class="error-box" *ngIf="error()">{{ error() }}</div>
+
+  <div class="loading" *ngIf="loading() && !analysis()">Chargement de l’analyse…</div>
+
+  <ng-container *ngIf="analysis() as a">
+
+    <!-- ============ Bandeau d'alerte global ============ -->
+    <div class="alert-banner torch" *ngIf="banner() as b"
+         [class.banner-major]="b.major" [class.banner-minor]="!b.major">
+      <span class="lamp"></span>
+      <strong>
+        {{ b.count }} événement{{ b.count > 1 ? 's' : '' }} à justifier
+        <ng-container *ngIf="b.ongoing"> — machine actuellement à l’arrêt</ng-container>
+      </strong>
+    </div>
+
+    <!-- ============ Carte machine ============ -->
+    <section class="machine-head">
+      <div class="mh-left">
+        <div class="mh-name">🤖 {{ currentInfo()?.machineName || a.machine }}</div>
+        <div class="mh-sub">
+          <span class="machine-tag">{{ a.machine }}</span>
+          <span class="article-tag" *ngIf="currentInfo()?.article">📦 {{ currentInfo()?.article }}</span>
+          <span class="article-tag muted" *ngIf="!currentInfo()?.article">Aucun article saisi</span>
+        </div>
+      </div>
+      <div class="mh-right">
+        <span class="status-chip" [ngClass]="statusInfo().cls">{{ statusInfo().label }}</span>
+        <div class="mh-meta">
+          Poste idéal : <strong>{{ a.ideal.start | date:'HH:mm' }} → {{ a.ideal.end | date:'HH:mm' }}</strong>
+          · Cible : <strong>{{ a.target }} PPM</strong><br />
+          Arrêt ≥ {{ secLabel(a.thresholds.minorSec) }} · Arrêt grave ≥ {{ secLabel(a.thresholds.majorSec) }}
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Alertes à justifier ============ -->
+    <section class="alerts-section" *ngIf="alerts().length > 0">
+      <h2>🚨 Événements à traiter</h2>
+
+      <div class="alert-card torch"
+           *ngFor="let e of alerts(); trackBy: trackRef"
+           [class.alert-major]="e.severity === 'MAJOR'"
+           [class.alert-minor]="e.severity === 'MINOR'"
+           [class.blink]="blinks(e)"
+           [class.alert-done]="!blinks(e)">
+        <div class="alert-head">
+          <span class="lamp"></span>
+          <strong class="alert-title">{{ eventTitle(e) }}</strong>
+          <span class="sev-badge" [class.sev-major]="e.severity === 'MAJOR'">
+            {{ e.severity === 'MAJOR' ? 'GRAVE' : 'MINEUR' }}
+          </span>
+          <span class="live-badge" *ngIf="e.ongoing">EN COURS</span>
+        </div>
+
+        <div class="alert-meta">
+          {{ e.startTs | date:'HH:mm:ss' }} →
+          <ng-container *ngIf="e.endTs; else ongoingTxt">{{ e.endTs | date:'HH:mm:ss' }}</ng-container>
+          <ng-template #ongoingTxt>maintenant</ng-template>
+          · durée <strong>{{ dur(e.durationMin) }}</strong>
+          · pièces perdues ≈ <strong>{{ e.lostMin * a.target | number:'1.0-0' }}</strong>
+        </div>
+
+        <div class="alert-form">
+          <select [ngModel]="draft(e).category" (ngModelChange)="setCategory(e, $event)">
+            <option value="">— Choisir la cause —</option>
+            <option *ngFor="let c of categories" [value]="c">{{ c }}</option>
+          </select>
+          <input type="text" maxlength="300" placeholder="Commentaire (ex : changement de barre fer)"
+                 [ngModel]="draft(e).comment" (ngModelChange)="setComment(e, $event)"
+                 (keyup.enter)="saveReason(e)" />
+          <button type="button" class="btn-primary" (click)="saveReason(e)">Justifier</button>
+        </div>
+        <div class="reason-msg" *ngIf="reasonMsg[e.ref]">{{ reasonMsg[e.ref] }}</div>
+      </div>
+    </section>
+
+    <!-- ============ Indicateurs ============ -->
+    <section class="kpi-row">
+      <div class="kpi-card">
+        <span class="kpi-title">Production réelle</span>
+        <div class="kpi-value green">{{ a.real.pieces | number }} <small>pcs</small></div>
+        <span class="kpi-sub">Idéal du poste : {{ a.ideal.pieces | number }} pcs</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Écart vs idéal {{ isToday() ? '(à cet instant)' : '' }}</span>
+        <div class="kpi-value" [class.green]="a.gap.pieces >= 0" [class.red]="a.gap.pieces < 0">
+          {{ a.gap.pieces > 0 ? '+' : '' }}{{ a.gap.pieces | number }} <small>pcs</small>
+        </div>
+        <span class="kpi-sub">{{ a.gap.pct | percent:'1.0-0' }} de l’objectif</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Démarrage réel</span>
+        <div class="kpi-value" [class.red]="a.start.lateMin > 0" [class.green]="a.start.lateMin === 0">
+          {{ a.real.start ? (a.real.start | date:'HH:mm') : '—' }}
+        </div>
+        <span class="kpi-sub">
+          <ng-container *ngIf="a.start.lateMin > 0">Retard : {{ dur(a.start.lateMin) }}</ng-container>
+          <ng-container *ngIf="a.start.earlyMin > 0">Avance : +{{ dur(a.start.earlyMin) }} (gain)</ng-container>
+          <ng-container *ngIf="a.start.lateMin === 0 && a.start.earlyMin === 0">À l’heure</ng-container>
+        </span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Arrêts</span>
+        <div class="kpi-value orange">{{ a.kpi.nbStops }} <small>arrêt(s)</small></div>
+        <span class="kpi-sub">
+          Perdu : {{ dur(a.totals.stopsLostMin) }} · moyen : {{ dur(a.kpi.mttrMin) }} · max : {{ dur(a.kpi.longestStopMin) }}
+        </span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Disponibilité</span>
+        <div class="kpi-value blue">{{ a.kpi.availability | percent:'1.0-0' }}</div>
+        <span class="kpi-sub">Marche : {{ dur(a.totals.runMin) }} sur {{ dur(a.totals.winMin) }}</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">Performance</span>
+        <div class="kpi-value purple">{{ a.kpi.performance | percent:'1.0-0' }}</div>
+        <span class="kpi-sub">Cadence en marche : {{ a.kpi.avgRunPPM | number:'1.1-2' }} PPM</span>
+      </div>
+
+      <div class="kpi-card">
+        <span class="kpi-title">TRS (Disponibilité × Performance)</span>
+        <div class="kpi-value" [class.green]="a.kpi.trs >= 0.85" [class.orange]="a.kpi.trs < 0.85 && a.kpi.trs >= 0.6"
+             [class.red]="a.kpi.trs < 0.6">
+          {{ a.kpi.trs | percent:'1.0-0' }}
+        </div>
+        <span class="kpi-sub">Hors qualité (pièces conformes non suivies)</span>
+      </div>
+
+      <div class="kpi-card" *ngIf="a.kpi.projection !== null">
+        <span class="kpi-title">Projection fin de poste</span>
+        <div class="kpi-value" [class.green]="a.kpi.projection >= a.ideal.pieces" [class.red]="a.kpi.projection < a.ideal.pieces">
+          {{ a.kpi.projection | number }} <small>pcs</small>
+        </div>
+        <span class="kpi-sub">Au rythme des 30 dernières minutes</span>
+      </div>
+      <div class="kpi-card" *ngIf="a.kpi.projection === null">
+        <span class="kpi-title">Fin de production</span>
+        <div class="kpi-value" [class.red]="a.end.earlyMin > 0" [class.green]="a.end.earlyMin === 0">
+          {{ a.real.end ? (a.real.end | date:'HH:mm') : '—' }}
+        </div>
+        <span class="kpi-sub">
+          <ng-container *ngIf="a.end.earlyMin > 0">Arrêt anticipé : −{{ dur(a.end.earlyMin) }}</ng-container>
+          <ng-container *ngIf="a.end.lateMin > 0">Prolongation : +{{ dur(a.end.lateMin) }} (gain)</ng-container>
+          <ng-container *ngIf="a.end.earlyMin === 0 && a.end.lateMin === 0">À l’heure</ng-container>
+        </span>
+      </div>
+    </section>
+
+    <!-- ============ Production réelle vs idéale ============ -->
+    <section class="card progress-card">
+      <h3>🎯 Production réelle vs idéale</h3>
+      <div class="progress-track">
+        <div class="progress-fill" [style.width.%]="progressPct(a)"
+             [class.fill-ok]="a.gap.pieces >= 0" [class.fill-low]="a.gap.pieces < 0"></div>
+        <div class="progress-marker" [style.left.%]="markerPct(a)" title="Idéal à cet instant"></div>
+      </div>
+      <div class="progress-legend">
+        <span><strong>{{ a.real.pieces | number }}</strong> pcs réalisées</span>
+        <span>Idéal à cet instant : <strong>{{ a.ideal.piecesToDate | number }}</strong> pcs</span>
+        <span>Objectif du poste : <strong>{{ a.ideal.pieces | number }}</strong> pcs</span>
+      </div>
+      <p class="gain-line" *ngIf="a.real.piecesOutside > 0 || a.start.earlyMin > 0 || a.end.lateMin > 0">
+        ✅ Gain hors horaire idéal : <strong>+{{ a.real.piecesOutside | number }} pcs</strong>
+        (avance au démarrage : {{ dur(a.start.earlyMin) }} · prolongation : {{ dur(a.end.lateMin) }})
+      </p>
+    </section>
+
+    <!-- ============ Chronologie ============ -->
+    <section class="card" *ngIf="timelineBar() as tl">
+      <h3>🕒 Chronologie de la journée</h3>
+      <div class="tl-wrap">
+        <div class="tl-axis">
+          <span class="tl-tick" *ngFor="let t of tl.ticks" [style.left.%]="t.left">{{ t.label }}</span>
+        </div>
+        <div class="tl-bar">
+          <div class="tl-ideal" [style.left.%]="tl.idealLeft" [style.width.%]="tl.idealRight - tl.idealLeft"></div>
+          <div class="tl-seg" *ngFor="let s of tl.segs"
+               [ngClass]="'seg-' + s.type" [style.left.%]="s.left" [style.width.%]="s.width"
+               [title]="s.title"></div>
+          <div class="tl-now" *ngIf="tl.nowLeft !== null" [style.left.%]="tl.nowLeft"></div>
+        </div>
+      </div>
+      <div class="tl-legend">
+        <span><i class="dot seg-run"></i> Production</span>
+        <span><i class="dot seg-late"></i> Retard / non démarré</span>
+        <span><i class="dot seg-minor"></i> Arrêt</span>
+        <span><i class="dot seg-major"></i> Arrêt grave</span>
+        <span><i class="dot seg-end"></i> Fin anticipée</span>
+        <span><i class="dot dot-ideal"></i> Poste idéal</span>
+      </div>
+    </section>
+
+    <!-- ============ Graphiques ============ -->
+    <section class="charts-row">
+      <div class="card chart-box">
+        <h3>📈 Cumul de production : réel vs idéal</h3>
+        <div class="chart-wrapper">
+          <canvas baseChart [data]="cumulativeChart()" [options]="cumulativeOptions" [type]="lineType"></canvas>
+        </div>
+      </div>
+      <div class="card chart-box">
+        <h3>📊 Production par tranche de 15 min</h3>
+        <div class="chart-wrapper">
+          <canvas baseChart [data]="slotChart()" [options]="slotOptions" [type]="barType"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ Bilan des causes ============ -->
+    <section class="card">
+      <h3>🧾 Bilan des pertes : causes et temps perdus</h3>
+
+      <div class="bilan-summary">
+        <div>
+          <span class="bs-label">Écart de production</span>
+          <span class="bs-val" [class.green]="a.gap.pieces >= 0" [class.red]="a.gap.pieces < 0">
+            {{ a.gap.pieces > 0 ? '+' : '' }}{{ a.gap.pieces | number }} pcs
+          </span>
+        </div>
+        <div>
+          <span class="bs-label">Pièces perdues (causes)</span>
+          <span class="bs-val red">−{{ totalLostPieces(a) | number }} pcs</span>
+        </div>
+        <div>
+          <span class="bs-label">Temps perdu (arrêts + retard + fin)</span>
+          <span class="bs-val orange">
+            {{ dur(a.totals.stopsLostMin + a.start.lateMin + a.end.earlyMin) }}
+          </span>
+        </div>
+      </div>
+
+      <div class="empty" *ngIf="a.causes.length === 0">Aucune perte détectée sur la période. 👍</div>
+
+      <div class="cause-row" *ngFor="let c of a.causes">
+        <div class="cause-label">
+          <span>{{ c.label }}</span>
+          <small *ngIf="c.count > 0">{{ c.count }} événement{{ c.count > 1 ? 's' : '' }}</small>
+        </div>
+        <div class="cause-bar-wrap">
+          <div class="cause-bar" [class.cause-unjust]="c.label.startsWith('Non justifié')"
+               [class.cause-speed]="c.kind === 'SPEED'" [style.width.%]="causeWidth(a, c.pieces)"></div>
+        </div>
+        <div class="cause-val"><strong>{{ dur(c.minutes) }}</strong> · −{{ c.pieces | number }} pcs</div>
+      </div>
+
+      <p class="gain-line" *ngIf="a.totals.speedLossPieces < 0">
+        ✅ Cadence supérieure à la cible pendant la marche : <strong>+{{ -a.totals.speedLossPieces | number }} pcs</strong>
+      </p>
+    </section>
+
+    <!-- ============ Journal ============ -->
+    <section class="card">
+      <div class="journal-header">
+        <h3>📋 Journal des arrêts et retards</h3>
+        <span class="journal-count">{{ a.events.length }} événement(s)</span>
+      </div>
+
+      <div class="empty" *ngIf="a.events.length === 0">Aucun arrêt ni retard sur cette journée.</div>
+
+      <div class="table-wrapper" *ngIf="a.events.length > 0">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Type</th><th>Début</th><th>Fin</th><th>Durée</th><th>Temps perdu</th>
+              <th>Gravité</th><th>Cause</th><th>Commentaire</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr *ngFor="let e of a.events; trackBy: trackRef">
+              <td>{{ eventTitle(e) }}</td>
+              <td>{{ e.startTs | date:'HH:mm:ss' }}</td>
+              <td>{{ e.endTs ? (e.endTs | date:'HH:mm:ss') : 'en cours' }}</td>
+              <td>{{ dur(e.durationMin) }}</td>
+              <td>{{ dur(e.lostMin) }}</td>
+              <td>
+                <span class="sev-badge" [class.sev-major]="e.severity === 'MAJOR'">
+                  {{ e.severity === 'MAJOR' ? 'GRAVE' : 'MINEUR' }}
+                </span>
+              </td>
+              <td>
+                <span *ngIf="e.category">{{ e.category }}</span>
+                <span *ngIf="!e.category && !e.justified" class="unjust">Non justifié</span>
+              </td>
+              <td class="muted">{{ e.comment || '—' }}</td>
+              <td>
+                <button type="button" class="btn-ghost" *ngIf="e.justified" (click)="reopen(e)">Modifier</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </ng-container>
+
+  <div class="empty" *ngIf="!analysis() && !loading() && !error() && !effectiveMachine()">
+    Aucune machine détectée. Elles apparaissent automatiquement dès leur premier signal.
+  </div>
+</div>
+
+
+historique .scss
+$bg: #0b1120;
+$card: #0f172a;
+$card-2: #111827;
+$border: rgba(255, 255, 255, 0.08);
+$text: #e5e7eb;
+$muted: #9ca3af;
+$blue: #3b82f6;
+$green: #10b981;
+$orange: #f59e0b;
+$red: #ef4444;
+$purple: #8b5cf6;
+
+:host {
+  display: block;
+  min-height: 100vh;
+  background: $bg;
+  color: $text;
+}
+
+.prod-container {
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.muted { color: $muted; }
+.green { color: $green; }
+.red { color: $red; }
+.orange { color: $orange; }
+.blue { color: $blue; }
+.purple { color: $purple; }
+
+// ---------- Contrôles ----------
+.top-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  background: $card;
+  border: 1px solid $border;
+  border-radius: 16px;
+  padding: 1.5rem 2rem;
+
+  h1 { margin: 0.25rem 0; font-size: 1.8rem; }
+  .subtitle { margin: 0; color: $muted; }
+  .back-home { color: $blue; text-decoration: none; font-weight: 600; font-size: 0.9rem; }
+  .pulse-icon { color: $green; font-size: 0.8rem; margin-right: 0.3rem; }
+}
+
+.controls-section {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.control-item {
+  label { display: block; font-size: 0.75rem; text-transform: uppercase; color: $muted; margin-bottom: 0.35rem; }
+}
+
+.date-nav { display: flex; gap: 0.4rem; align-items: center; }
+
+select, input[type='text'], input[type='date'], input[type='time'], input[type='number'] {
+  background: $card-2;
+  border: 1px solid #374151;
+  color: #fff;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  outline: none;
+  min-width: 0;
+  color-scheme: dark;
+
+  &:focus { border-color: $blue; }
+  &::placeholder { color: #6b7280; }
+}
+
+.btn-primary, .btn-ghost, .btn-settings {
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.55rem 1rem;
+  white-space: nowrap;
+}
+.btn-primary { background: $blue; color: #fff; border: none; &:hover { background: #2563eb; } }
+.btn-ghost {
+  background: transparent; color: $muted; border: 1px solid #374151; font-weight: 500;
+  &:hover:not(:disabled) { color: #fff; border-color: #6b7280; }
+  &:disabled { opacity: 0.4; cursor: default; }
+}
+.btn-settings { background: rgba(139, 92, 246, 0.15); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.4); }
+
+.settings-panel {
+  background: $card;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 16px;
+  padding: 1.25rem 1.5rem;
+
+  h3 { margin: 0 0 1rem; }
+  .hint { color: $muted; font-size: 0.8rem; margin: 0.75rem 0 0; }
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 1rem;
+  align-items: end;
+
+  .field label { display: block; font-size: 0.75rem; color: $muted; margin-bottom: 0.3rem; }
+  .field input { width: 100%; box-sizing: border-box; }
+  .field-btn { display: flex; align-items: center; gap: 0.75rem; }
+  .msg { color: #34d399; font-size: 0.85rem; }
+}
+
+.error-box {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+}
+.loading, .empty { color: $muted; text-align: center; padding: 1.5rem; }
+
+// ---------- Effet « torche » : s'allume, s'éteint, se rallume ----------
+@keyframes torch-slow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(var(--glow), 0), 0 0 4px rgba(var(--glow), 0.2); border-color: rgba(var(--glow), 0.35); }
+  50% { box-shadow: 0 0 22px 4px rgba(var(--glow), 0.65), 0 0 50px 12px rgba(var(--glow), 0.3); border-color: rgba(var(--glow), 1); }
+}
+@keyframes torch-fast {
+  0%, 45%, 100% { box-shadow: 0 0 0 0 rgba(var(--glow), 0), 0 0 4px rgba(var(--glow), 0.2); border-color: rgba(var(--glow), 0.3); }
+  20%, 70% { box-shadow: 0 0 26px 6px rgba(var(--glow), 0.85), 0 0 60px 16px rgba(var(--glow), 0.4); border-color: rgba(var(--glow), 1); }
+}
+@keyframes lamp-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+.lamp {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: rgb(var(--glow, 245, 158, 11));
+  box-shadow: 0 0 10px 2px rgba(var(--glow, 245, 158, 11), 0.8);
+}
+
+// ---------- Bandeau global ----------
+.alert-banner {
+  --glow: 245, 158, 11;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.9rem 1.25rem;
+  border-radius: 12px;
+  border: 2px solid rgba(var(--glow), 0.5);
+  background: rgba(var(--glow), 0.1);
+  animation: torch-slow 1.6s ease-in-out infinite;
+
+  .lamp { animation: lamp-pulse 1.6s ease-in-out infinite; }
+
+  &.banner-major {
+    --glow: 239, 68, 68;
+    animation: torch-fast 1s linear infinite;
+    .lamp { animation-duration: 1s; }
+  }
+}
+
+// ---------- Machine ----------
+.machine-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+  background: $card;
+  border: 1px solid $border;
+  border-radius: 16px;
+  padding: 1.25rem 1.75rem;
+
+  .mh-name { font-size: 1.5rem; font-weight: 700; }
+  .mh-sub { display: flex; gap: 0.6rem; margin-top: 0.5rem; flex-wrap: wrap; }
+  .mh-right { text-align: right; }
+  .mh-meta { color: $muted; font-size: 0.85rem; margin-top: 0.5rem; line-height: 1.5; strong { color: $text; } }
+}
+
+.machine-tag, .article-tag {
+  padding: 0.25rem 0.65rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.machine-tag { background: rgba(59, 130, 246, 0.15); color: #93c5fd; }
+.article-tag { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; &.muted { background: rgba(255, 255, 255, 0.05); color: $muted; font-weight: 400; } }
+
+.status-chip {
+  display: inline-block;
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+
+  &.st-run { background: rgba(16, 185, 129, 0.18); color: #34d399; }
+  &.st-minor { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+  &.st-major { background: rgba(239, 68, 68, 0.22); color: #f87171; }
+  &.st-done { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; }
+  &.st-wait { background: rgba(59, 130, 246, 0.18); color: #93c5fd; }
+}
+
+// ---------- Alertes ----------
+.alerts-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+
+  h2 { margin: 0; font-size: 1.1rem; }
+}
+
+.alert-card {
+  --glow: 245, 158, 11;
+  background: $card;
+  border: 2px solid rgba(var(--glow), 0.35);
+  border-radius: 14px;
+  padding: 1rem 1.25rem;
+
+  &.alert-major { --glow: 239, 68, 68; }
+
+  &.blink { animation: torch-slow 1.8s ease-in-out infinite; .lamp { animation: lamp-pulse 1.8s ease-in-out infinite; } }
+  &.blink.alert-major { animation: torch-fast 1s linear infinite; .lamp { animation: lamp-pulse 1s ease-in-out infinite; } }
+
+  &.alert-done { opacity: 0.85; border-color: rgba(255, 255, 255, 0.12); .lamp { background: $green; box-shadow: none; } }
+
+  .alert-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .alert-title { font-size: 1.05rem; }
+  .alert-meta { color: $muted; font-size: 0.88rem; margin: 0.5rem 0 0.8rem; strong { color: $text; } }
+}
+
+.sev-badge {
+  font-size: 0.7rem; font-weight: 700; padding: 0.15rem 0.55rem; border-radius: 999px;
+  background: rgba(245, 158, 11, 0.2); color: #fbbf24;
+  &.sev-major { background: rgba(239, 68, 68, 0.22); color: #f87171; }
+}
+.live-badge {
+  font-size: 0.7rem; font-weight: 700; padding: 0.15rem 0.55rem; border-radius: 999px;
+  background: #ef4444; color: #fff;
+}
+
+.alert-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) 1fr auto;
+  gap: 0.6rem;
+
+  input { width: 100%; box-sizing: border-box; }
+}
+.reason-msg { color: #34d399; font-size: 0.85rem; margin-top: 0.5rem; }
+
+// ---------- KPI ----------
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1rem;
+}
+.kpi-card {
+  background: $card;
+  border: 1px solid $border;
+  border-radius: 14px;
+  padding: 1.1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+
+  .kpi-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: $muted; }
+  .kpi-value { font-size: 2rem; font-weight: 800; small { font-size: 0.9rem; font-weight: 500; color: $muted; } }
+  .kpi-sub { color: $muted; font-size: 0.82rem; }
+}
+
+// ---------- Cartes génériques ----------
+.card {
+  background: $card;
+  border: 1px solid $border;
+  border-radius: 16px;
+  padding: 1.25rem 1.5rem;
+
+  h3 { margin: 0 0 1rem; font-size: 1.05rem; }
+}
+
+.progress-track {
+  position: relative;
+  height: 22px;
+  background: #1f2937;
+  border-radius: 999px;
+  overflow: visible;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.6s ease;
+  &.fill-ok { background: linear-gradient(90deg, #059669, $green); }
+  &.fill-low { background: linear-gradient(90deg, #b45309, $orange); }
+}
+.progress-marker {
+  position: absolute;
+  top: -5px;
+  bottom: -5px;
+  width: 3px;
+  background: #fff;
+  border-radius: 2px;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.8);
+}
+.progress-legend {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+  color: $muted;
+  font-size: 0.88rem;
+  strong { color: $text; }
+}
+.gain-line { color: #6ee7b7; font-size: 0.9rem; margin: 0.9rem 0 0; }
+
+// ---------- Chronologie ----------
+.tl-wrap { padding: 0 0.5rem; }
+.tl-axis { position: relative; height: 18px; margin-bottom: 4px; }
+.tl-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 0.7rem;
+  color: $muted;
+}
+.tl-bar {
+  position: relative;
+  height: 34px;
+  background: #1f2937;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.tl-ideal {
+  position: absolute; top: 0; bottom: 0;
+  border-left: 2px dashed rgba(255, 255, 255, 0.45);
+  border-right: 2px dashed rgba(255, 255, 255, 0.45);
+  background: rgba(255, 255, 255, 0.04);
+}
+.tl-seg { position: absolute; top: 4px; bottom: 4px; border-radius: 4px; }
+.tl-now {
+  position: absolute; top: 0; bottom: 0; width: 2px; background: #fff;
+  box-shadow: 0 0 8px #fff;
+  animation: lamp-pulse 1.2s ease-in-out infinite;
+}
+.seg-run { background: $green; opacity: 0.85; }
+.seg-late { background: repeating-linear-gradient(45deg, #f59e0b, #f59e0b 6px, #b45309 6px, #b45309 12px); }
+.seg-minor { background: $orange; }
+.seg-major { background: $red; box-shadow: 0 0 8px rgba(239, 68, 68, 0.8); }
+.seg-end { background: repeating-linear-gradient(45deg, #64748b, #64748b 6px, #334155 6px, #334155 12px); }
+.tl-legend {
+  display: flex; flex-wrap: wrap; gap: 1.25rem; margin-top: 0.9rem; color: $muted; font-size: 0.8rem;
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 0.35rem; vertical-align: -1px; }
+  .dot-ideal { border: 2px dashed rgba(255, 255, 255, 0.5); background: transparent; }
+}
+
+// ---------- Graphiques ----------
+.charts-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 1rem; }
+.chart-wrapper { position: relative; height: 300px; }
+
+// ---------- Bilan ----------
+.bilan-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+
+  > div { background: $card-2; border-radius: 10px; padding: 0.8rem 1rem; }
+  .bs-label { display: block; color: $muted; font-size: 0.75rem; text-transform: uppercase; }
+  .bs-val { font-size: 1.4rem; font-weight: 800; }
+}
+
+.cause-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 280px) 1fr minmax(150px, 200px);
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+
+  .cause-label { display: flex; flex-direction: column; small { color: $muted; } }
+  .cause-bar-wrap { background: #1f2937; border-radius: 999px; height: 12px; overflow: hidden; }
+  .cause-bar { height: 100%; border-radius: 999px; background: $blue;
+    &.cause-unjust { background: $red; }
+    &.cause-speed { background: $purple; } }
+  .cause-val { text-align: right; font-size: 0.9rem; color: $muted; strong { color: $text; } }
+}
+
+// ---------- Journal ----------
+.journal-header { display: flex; justify-content: space-between; align-items: center; h3 { margin: 0 0 1rem; } }
+.journal-count { color: $muted; font-size: 0.85rem; }
+.table-wrapper { overflow-x: auto; }
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+
+  th { text-align: left; font-size: 0.72rem; text-transform: uppercase; color: $muted; padding: 0.6rem; border-bottom: 1px solid $border; white-space: nowrap; }
+  td { padding: 0.55rem 0.6rem; border-bottom: 1px solid rgba(255, 255, 255, 0.04); font-size: 0.9rem; }
+  .unjust { color: #f87171; font-weight: 600; }
+}
+
+// ---------- Accessibilité : pas d'animation si demandé ----------
+@media (prefers-reduced-motion: reduce) {
+  .alert-banner, .alert-card.blink, .lamp, .tl-now { animation: none !important; }
+  .alert-banner, .alert-card.blink { box-shadow: 0 0 16px 2px rgba(var(--glow), 0.6); }
+}
+
+// ---------- Responsive ----------
+@media (max-width: 900px) {
+  .prod-container { padding: 1rem; }
+  .top-bar { padding: 1rem; }
+  .machine-head .mh-right { text-align: left; }
+  .alert-form { grid-template-columns: 1fr; }
+  .charts-row { grid-template-columns: 1fr; }
+  .cause-row { grid-template-columns: 1fr; gap: 0.4rem; .cause-val { text-align: left; } }
+}
+
+
+saisie .ts

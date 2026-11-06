@@ -1,0 +1,124 @@
+$port     = 9801
+$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $port)
+$listener.Start()
+Write-Host "📡 Serveur Relais Multi-Clients démarré sur le port $port..." -ForegroundColor Magenta
+
+$clients = New-Object System.Collections.Generic.List[System.Net.Sockets.TcpClient]
+$buffer  = New-Object byte[] 4096
+
+try {
+    while ($true) {
+        # 1. Accepter de nouvelles connexions (sans bloquer)
+        while ($listener.Pending()) {
+            $newClient = $listener.AcceptTcpClient()
+            $clients.Add($newClient)
+            $ep = $newClient.Client.RemoteEndPoint
+            Write-Host "$(Get-Date -Format 'HH:mm:ss') ✔ Client connecté : $ep" -ForegroundColor Green
+        }
+
+        # 2. Parcourir tous les clients connectés
+        for ($i = $clients.Count - 1; $i -ge 0; $i--) {
+            $c = $clients[$i]
+
+            # Supprimer les clients déconnectés
+            if (-not $c.Connected) {
+                Write-Host "$(Get-Date -Format 'HH:mm:ss') ✖ Client déconnecté" -ForegroundColor Red
+                $c.Close()
+                $clients.RemoveAt($i)
+                continue
+            }
+
+            # Lire les données si disponibles
+            $stream = $c.GetStream()
+            if ($stream.DataAvailable) {
+                $count = $stream.Read($buffer, 0, $buffer.Length)
+                if ($count -gt 0) {
+                    $msg = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count)
+                    
+                    # 3. RELAYER le message à TOUS les autres clients connectés (votre PC Gamer !)
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($msg)
+                    foreach ($otherClient in $clients) {
+                        if ($otherClient -ne $c -and $otherClient.Connected) {
+                            try {
+                                $otherClient.GetStream().Write($bytes, 0, $bytes.Length)
+                            } catch {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Start-Sleep -Milliseconds 20
+    }
+}
+finally {
+    foreach ($c in $clients) { $c.Close() }
+    $listener.Stop()
+    Write-Host "Serveur arrêté." -ForegroundColor DarkGray
+}
+
+
+
+*******************************************************************************************************************************************
+
+
+
+$port     = 9801
+$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $port)
+$listener.Start()
+Write-Host "📡 Serveur Relais Multi-Clients démarré sur le port $port..." -ForegroundColor Magenta
+
+$clients = New-Object System.Collections.Generic.List[System.Net.Sockets.TcpClient]
+$buffer  = New-Object byte[] 4096
+
+try {
+    while ($true) {
+        # 1. Accepter de nouvelles connexions
+        while ($listener.Pending()) {
+            $newClient = $listener.AcceptTcpClient()
+            $clients.Add($newClient)
+            $ep = $newClient.Client.RemoteEndPoint
+            Write-Host "$(Get-Date -Format 'HH:mm:ss') 🟢 Client connecté : $ep" -ForegroundColor Green
+        }
+
+        # 2. Parcourir tous les clients
+        for ($i = $clients.Count - 1; $i -ge 0; $i--) {
+            $c = $clients[$i]
+
+            if (-not $c.Connected) {
+                Write-Host "$(Get-Date -Format 'HH:mm:ss') 🔴 Client déconnecté" -ForegroundColor Red
+                $c.Close()
+                $clients.RemoveAt($i)
+                continue
+            }
+
+            $stream = $c.GetStream()
+            if ($stream.DataAvailable) {
+                $count = $stream.Read($buffer, 0, $buffer.Length)
+                if ($count -gt 0) {
+                    $msg = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $count)
+                    $ep  = $c.Client.RemoteEndPoint
+                    
+                    # 💡 AFFICHER LA TRAME EN DIRECT
+                    Write-Host "$(Get-Date -Format 'HH:mm:ss') 📥 REÇU de $ep : $($msg.Trim())" -ForegroundColor Cyan
+
+                    # 3. RELAYER à tous les autres clients
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($msg)
+                    foreach ($otherClient in $clients) {
+                        if ($otherClient -ne $c -and $otherClient.Connected) {
+                            try {
+                                $otherClient.GetStream().Write($bytes, 0, $bytes.Length)
+                            } catch {}
+                        }
+                    }
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 20
+    }
+}
+finally {
+    foreach ($c in $clients) { $c.Close() }
+    $listener.Stop()
+    Write-Host "Serveur arrêté." -ForegroundColor DarkGray
+}

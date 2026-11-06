@@ -1,4 +1,5 @@
-require('dotenv').config();   // charge le fichier .env (doit rester en 1re ligne)
+require('dotenv').config(); 
+console.log('Telegram token présent :', !!process.env.TELEGRAM_TOKEN, '| chat id :', process.env.TELEGRAM_CHAT_ID);  // charge le fichier .env (doit rester en 1re ligne)
 const net = require('net');
 const express = require('express');
 const http = require('http');
@@ -88,6 +89,19 @@ db.serialize(() => {
     key TEXT PRIMARY KEY,
     value TEXT
   )`);
+    // Table 4 : Machines détectées automatiquement
+  db.run(`CREATE TABLE IF NOT EXISTS machines (
+    machine TEXT PRIMARY KEY,
+    label TEXT,
+    target_ppm REAL,          -- NULL = utilise la cible globale
+    first_seen TEXT,
+    last_seen TEXT
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_cnc_machine_id ON cnc(machine, id)`);
+
+  // Reprise de l'existant : les machines déjà présentes dans cnc sont enregistrées
+  db.run(`INSERT OR IGNORE INTO machines (machine, first_seen, last_seen)
+          SELECT machine, MIN(timestamp), MAX(timestamp) FROM cnc GROUP BY machine`);
 });
 
 // ==========================================
@@ -141,7 +155,10 @@ app.post('/api/settings', (req, res) => {
   );
 });
 
-io.on('connection', (socket) => socket.emit('settingsUpdate', { targetPPM }));
+io.on('connection', (socket) => {
+  socket.emit('settingsUpdate', { targetPPM });
+  listMachines((err, list) => { if (!err) socket.emit('machinesUpdate', list); });
+});
 
 // ==========================================
 // ALERTES (TELEGRAM / WHATSAPP)
@@ -218,23 +235,102 @@ const hhmmss = (ms) =>
   new Date(ms).toLocaleTimeString('fr-FR', {
     timeZone: 'Africa/Tunis', hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
+// ==========================================
+// MACHINES (détection auto + cible par machine)
+// ==========================================
+const machineTargets = new Map();   // machine -> target_ppm (absent = cible globale)
+const knownMachines = new Set();
+const getTarget = (m) => machineTargets.get(m) || targetPPM;
+
+const cleanMachine = (v, req) => {
+  let m = String(v || '').trim();
+  if (!m && req) m = String(req.ip || '').replace(/^::ffff:/, '');   // repli : IP de l'émetteur
+  m = m.replace(/[^\w.\-: ]/g, '').slice(0, 64);                      // assainissement
+  return m || 'Inconnue';
+};
+
+function listMachines(cb) {
+  db.all(`
+    SELECT m.machine, m.label, m.target_ppm, m.first_seen, m.last_seen,
+      (SELECT compteur FROM cnc WHERE machine = m.machine ORDER BY id DESC LIMIT 1) AS last_counter
+    FROM machines m ORDER BY m.machine
+  `, [], (err, rows) => {
+    if (err) return cb(err);
+    cb(null, (rows || []).map(r => ({
+      machine: r.machine,
+      label: r.label,
+      targetPPM: r.target_ppm || targetPPM,
+      customTarget: r.target_ppm != null,
+      firstSeen: r.first_seen ? parseTs(r.first_seen).toISOString() : null,
+      lastSeen: r.last_seen ? parseTs(r.last_seen).toISOString() : null,
+      lastCounter: r.last_counter,
+      state: (machineState.get(r.machine) || {}).state || 'UNKNOWN'
+    })));
+  });
+}
+
+function emitMachines() {
+  listMachines((err, list) => { if (!err) io.emit('machinesUpdate', list); });
+}
+
+// Appelée à chaque tick : crée la machine si nouvelle, met à jour last_seen
+function registerMachine(machine, nowIso) {
+  const isNew = !knownMachines.has(machine);
+  knownMachines.add(machine);
+  db.run(
+    `INSERT INTO machines (machine, first_seen, last_seen) VALUES (?, ?, ?)
+     ON CONFLICT(machine) DO UPDATE SET last_seen = excluded.last_seen`,
+    [machine, nowIso, nowIso],
+    (err) => {
+      if (err) return console.error('❌ Insert machines :', err.message);
+      if (isNew) {
+        console.log(`🆕 Nouvelle machine détectée : ${machine}`);
+        sendAlert(`🆕 Nouvelle machine CNC détectée\nMachine : ${machine}\nHeure : ${hhmmss(Date.parse(nowIso))}`);
+        emitMachines();
+      }
+    }
+  );
+}
+
+// Au démarrage : recharge les cibles et l'état (pour que le watchdog survive à un redémarrage)
+function loadMachines(cb) {
+  db.all(`SELECT machine, target_ppm FROM machines`, [], (err, rows) => {
+    if (!err) (rows || []).forEach(r => {
+      knownMachines.add(r.machine);
+      if (r.target_ppm > 0) machineTargets.set(r.machine, r.target_ppm);
+    });
+    db.all(`
+      SELECT c.machine, c.timestamp, c.compteur FROM cnc c
+      INNER JOIN (SELECT machine, MAX(id) AS max_id FROM cnc GROUP BY machine) t
+        ON c.id = t.max_id
+    `, [], (err2, last) => {
+      if (!err2) (last || []).forEach(r => machineState.set(r.machine, {
+        lastTs: parseTs(r.timestamp).getTime(),
+        lastCounter: r.compteur,
+        state: 'OK',
+        lastAlertAt: 0
+      }));
+      if (cb) cb();
+    });
+  });
+}
 
 function evaluateTick(machine, compteur, ts) {
   const st = machineState.get(machine) ||
     { lastTs: null, lastCounter: null, state: 'OK', lastAlertAt: 0 };
   machineState.set(machine, st);
+  const target = getTarget(machine);
 
   if (st.state === 'STALL') {
-    // Un tick arrive après un arrêt → reprise
     st.state = 'OK';
     st.lastAlertAt = Date.now();
     sendAlert(`✅ REPRISE CNC\nMachine : ${machine}\nHeure : ${hhmmss(ts)}\nCompteur : ${compteur}`);
-  } else if (st.lastTs && targetPPM > 0) {
+  } else if (st.lastTs && target > 0) {
     const dtMin = (ts - st.lastTs) / 60000;
     const delta = compteur - st.lastCounter;
     if (dtMin > 0.05 && delta >= 0) {
       const ppm = delta / dtMin;
-      const ratio = ppm / targetPPM;
+      const ratio = ppm / target;
       const now = Date.now();
 
       if (ratio < ALERT.dropRatio) {
@@ -245,14 +341,14 @@ function evaluateTick(machine, compteur, ts) {
           sendAlert(
             `🚨 CHUTE DE CADENCE CNC\n` +
             `Machine : ${machine}\n` +
-            `Cadence : ${ppm.toFixed(2)} PPM (cible ${targetPPM}) → ${Math.round(ratio * 100)} %\n` +
+            `Cadence : ${ppm.toFixed(2)} PPM (cible ${target}) → ${Math.round(ratio * 100)} %\n` +
             `Intervalle : ${dtMin.toFixed(1)} min pour +${delta} pcs\n` +
             `Heure : ${hhmmss(ts)}\nCompteur : ${compteur}`
           );
         }
       } else if (ratio >= ALERT.recoverRatio && st.state === 'DROP') {
         st.state = 'OK';
-        sendAlert(`✅ Cadence rétablie\nMachine : ${machine}\n${ppm.toFixed(2)} PPM (cible ${targetPPM})\nHeure : ${hhmmss(ts)}`);
+        sendAlert(`✅ Cadence rétablie\nMachine : ${machine}\n${ppm.toFixed(2)} PPM (cible ${target})\nHeure : ${hhmmss(ts)}`);
       }
     }
   }
@@ -262,19 +358,20 @@ function evaluateTick(machine, compteur, ts) {
 
 // Watchdog : détecte l'arrêt SANS attendre le prochain tick
 setInterval(() => {
-  if (!(targetPPM > 0)) return;
-  const limitMin = Math.max(ALERT.minStallMin, (1 / targetPPM) * ALERT.stallFactor);
   for (const [machine, st] of machineState) {
-    if (!st.lastTs || st.state === 'STALL') continue;
+    const target = getTarget(machine);
+    if (!(target > 0) || !st.lastTs || st.state === 'STALL') continue;
+    const limitMin = Math.max(ALERT.minStallMin, (1 / target) * ALERT.stallFactor);
     const idleMin = (Date.now() - st.lastTs) / 60000;
     if (idleMin > limitMin) {
       st.state = 'STALL';
       st.lastAlertAt = Date.now();
       sendAlert(
         `🛑 ARRÊT CNC DÉTECTÉ\nMachine : ${machine}\n` +
-        `Aucun signal depuis ${idleMin.toFixed(1)} min (cible ${targetPPM} PPM)\n` +
+        `Aucun signal depuis ${idleMin.toFixed(1)} min (cible ${target} PPM)\n` +
         `Dernier signal : ${hhmmss(st.lastTs)}`
       );
+      emitMachines();
     }
   }
 }, 15000);
@@ -372,7 +469,7 @@ app.post('/api/reset', (req, res) => {
 // Réception d'un tick compteur (depuis PowerShell / machine usine)
 app.post('/api/measure', (req, res) => {
   const { machine, compteur, date } = req.body || {};
-  const machineName = machine || 'Inconnue';
+    const machineName = cleanMachine(machine, req);
   const numCompteur = parseInt(compteur, 10) || 0;
   const nowIso = new Date().toISOString();
   console.log(`\n📥 [${date || new Date().toISOString()}] CNC (${machineName}) → ${numCompteur}`);
@@ -392,7 +489,7 @@ app.post('/api/measure', (req, res) => {
         machine: machineName,
         compteur: numCompteur
       };
-
+      registerMachine(machineName, nowIso);
       io.emit('cncUpdate', newCncRecord);
       evaluateTick(machineName, numCompteur, new Date(nowIso).getTime()); // ← alerte
 
@@ -404,10 +501,11 @@ app.post('/api/measure', (req, res) => {
 
 // Historique des compteurs CNC
 app.get('/api/cnc', (req, res) => {
-  const limit = parseInt(req.query.limit) || 50;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 5000);
+  const machine = req.query.machine ? cleanMachine(req.query.machine) : null;
   db.all(
-    'SELECT * FROM cnc ORDER BY id DESC LIMIT ?',
-    [limit],
+    `SELECT * FROM cnc ${machine ? 'WHERE machine = ?' : ''} ORDER BY id DESC LIMIT ?`,
+    machine ? [machine, limit] : [limit],
     (err, rows) => {
       if (err) return res.status(500).json({ error: err.message });
       res.json((rows || []).map(r => ({ ...r, timestamp: parseTs(r.timestamp).toISOString() })));
@@ -431,7 +529,56 @@ app.get('/api/cnc/latest', (req, res) => {
     res.json((rows || []).map(r => ({ ...r, timestamp: parseTs(r.timestamp).toISOString() })));
   });
 });
+// Liste des machines détectées (avec cible, état, dernier compteur)
+app.get('/api/machines', (req, res) => {
+  listMachines((err, list) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(list);
+  });
+});
 
+// Réglages d'une machine : cible PPM (null = cible globale) et libellé
+app.post('/api/machines/:machine/settings', (req, res) => {
+  const machine = cleanMachine(req.params.machine);
+  const { targetPPM: t, label } = req.body || {};
+
+  let target = null;
+  if (t !== null && t !== undefined && t !== '') {
+    target = parseFloat(t);
+    if (!(target > 0) || target > 1000) return res.status(400).json({ error: 'targetPPM invalide' });
+  }
+  const lbl = label ? String(label).trim().slice(0, 64) : null;
+
+  db.run(
+    `INSERT INTO machines (machine, label, target_ppm, first_seen) VALUES (?, ?, ?, ?)
+     ON CONFLICT(machine) DO UPDATE SET label = excluded.label, target_ppm = excluded.target_ppm`,
+    [machine, lbl, target, new Date().toISOString()],
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      knownMachines.add(machine);
+      if (target) machineTargets.set(machine, target); else machineTargets.delete(machine);
+      emitMachines();
+      res.json({ machine, targetPPM: target || targetPPM, customTarget: target != null, label: lbl });
+    }
+  );
+});
+
+// Suppression d'une machine retirée (ses compteurs sont supprimés aussi)
+app.delete('/api/machines/:machine', (req, res) => {
+  const machine = cleanMachine(req.params.machine);
+  db.serialize(() => {
+    db.run('DELETE FROM cnc WHERE machine = ?', [machine]);
+    db.run('DELETE FROM machines WHERE machine = ?', [machine], (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      machineState.delete(machine);
+      machineTargets.delete(machine);
+      knownMachines.delete(machine);
+      production.purgeMachine(machine);
+      emitMachines();
+      res.json({ success: true });
+    });
+  });
+});
 // Remise à zéro des compteurs CNC
 app.post('/api/cnc/reset', (req, res) => {
   db.run('DELETE FROM cnc', [], (err) => {
@@ -541,11 +688,11 @@ function connectTCP() {
     try { client.destroy(); } catch (_) {}
   });
 }
-
+const production = require('./production')({ app, db, io, getTarget, cleanMachine, parseTs, emitMachines });
 // ==========================================
 // DÉMARRAGE
 // ==========================================
-loadSettings();
+loadSettings(() => { loadMachines(); production.loadShift(); });
 connectTCP();
 
 server.listen(WEB_PORT, () => {
